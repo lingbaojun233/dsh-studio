@@ -134,40 +134,61 @@ export function apply(ctx, config) {
     : (process.env.DSH_STUDIO_VIDEO_URL || DEFAULT_VIDEO_URL);
   const videoUrl = videoUrlRaw ? trimBase(videoUrlRaw) : '';
 
-  // 1) 一步到底：写分镜 + 真渲染 -----------------------------------------
+  // 1) 一步到底 / 只写分镜：plan_only 决定打哪个接口 ----------------------
   ctx.tools.register({
     name: 'make_video',
     description:
-      'Render a short video from a written prompt. DSH writes only the storyboard (per-scene on-screen text, narration, seconds, gradient colors); ffmpeg renders the mp4 — no model generates imagery. This call really renders: it normally takes 15–40 s and the tool timeout is 1200 s, so do not call it twice for the same request. To review the storyboard with a human first, call make_plan and then call this once approved. Returns {ok, jobId, title, seconds, scenes:[{text, seconds, narration}], bytes, ms}, where seconds is the final video length (narration can stretch a scene).',
+      'Render a short video from a prompt: DSH writes the storyboard, ffmpeg renders the mp4 (no AI imagery). Takes 15–40 s, timeout 1200 s. plan_only:true writes only the storyboard.',
     parameters: {
       type: 'object',
-      additionalProperties: false,
       required: ['prompt'],
       properties: {
-        prompt: { type: 'string', description: 'What the video is about, in one or two sentences' },
+        prompt: { type: 'string' },
         seconds: {
           type: 'integer',
           minimum: 8,
           maximum: 30,
-          description: 'Target total length in seconds. Default 12. Clamped to 8–30',
+          description: 'Default 12; clamped to 8-30.',
         },
-        voice: { type: 'string', description: 'TTS voice name passed to the speech module; optional' },
-        bgm: {
-          type: 'string',
-          description: 'Background music file name in the studio bgm directory; optional',
-        },
+        plan_only: { type: 'boolean', description: 'true = storyboard only, nothing rendered.' },
+        voice: { type: 'string', description: 'TTS voice name for narration.' },
+        bgm: { type: 'string', description: 'BGM filename in the studio bgm dir.' },
       },
     },
     output: {
       schema: { type: 'object' },
-      render: (_args, value) => textBlock(describeVideo(value, videoUrl)),
+      // 两种模式返回形状不同：plan 只有 title/seconds/scenes，video 还带 jobId/bytes。
+      render: (args, value) => {
+        const planOnly =
+          (args && args.plan_only === true) || (value && value.ok !== false && !('jobId' in value));
+        return textBlock(planOnly ? describePlan(value) : describeVideo(value, videoUrl));
+      },
     },
     async execute(args) {
       const a = args || {};
+      const planOnly = a.plan_only === true;
       const prompt = String(a.prompt || '').trim();
-      if (!prompt) return { ok: false, stage: 'create', error: 'PROMPT_REQUIRED' };
+      if (!prompt) return { ok: false, stage: planOnly ? 'plan' : 'create', error: 'PROMPT_REQUIRED' };
 
       const payload = { prompt, seconds: clampSeconds(a.seconds) };
+
+      if (planOnly) {
+        // 只写分镜：和原来的 make_plan 一样，body 只有 prompt/seconds
+        const { status, data } = await requestJson('POST', `${baseUrl}/v1/plan`, {
+          body: payload,
+          timeoutMs: PLAN_TIMEOUT_MS,
+        });
+        if (!data || !data.ok) return failure(data, 'plan', status);
+
+        const plan = data.plan || {};
+        return {
+          ok: true,
+          title: String(plan.title || ''),
+          seconds: totalSeconds(data, plan),
+          scenes: summarizeScenes(plan),
+        };
+      }
+
       if (a.voice) payload.voice = String(a.voice);
       if (a.bgm) payload.bgm = String(a.bgm);
 
@@ -190,82 +211,35 @@ export function apply(ctx, config) {
     },
   });
 
-  // 2) 只写分镜，不渲染 ---------------------------------------------------
-  ctx.tools.register({
-    name: 'make_plan',
-    description:
-      'Write a storyboard only, without rendering anything: per-scene on-screen text, narration and seconds. Use it when the user wants to read or adjust the storyboard before spending a real render, or when only the scene breakdown is needed. Cheap and repeatable. Returns {ok, title, seconds, scenes:[{text, seconds, narration}]}. Producing the mp4 needs make_video.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['prompt'],
-      properties: {
-        prompt: { type: 'string', description: 'What the video is about, in one or two sentences' },
-        seconds: {
-          type: 'integer',
-          minimum: 8,
-          maximum: 30,
-          description: 'Target total length in seconds. Default 12. Clamped to 8–30',
-        },
-      },
-    },
-    output: {
-      schema: { type: 'object' },
-      render: (_args, value) => textBlock(describePlan(value)),
-    },
-    async execute(args) {
-      const a = args || {};
-      const prompt = String(a.prompt || '').trim();
-      if (!prompt) return { ok: false, stage: 'plan', error: 'PROMPT_REQUIRED' };
-
-      const payload = { prompt, seconds: clampSeconds(a.seconds) };
-      const { status, data } = await requestJson('POST', `${baseUrl}/v1/plan`, {
-        body: payload,
-        timeoutMs: PLAN_TIMEOUT_MS,
-      });
-      if (!data || !data.ok) return failure(data, 'plan', status);
-
-      const plan = data.plan || {};
-      return {
-        ok: true,
-        title: String(plan.title || ''),
-        seconds: totalSeconds(data, plan),
-        scenes: summarizeScenes(plan),
-      };
-    },
-  });
-
   // 2) 项目模式：长片的分段增量编辑 --------------------------------
   // 为什么要有它：make_video 每次都整片重渲。改一句台词也要重渲几十秒的画面，
   // 既慢又浪费。项目模式把每个场景渲成独立片段并缓存，改哪场只重渲哪场。
   ctx.tools.register({
     name: 'project_create',
     description:
-      'Create an editable video project (for longer videos: explainers, tutorials, 10+ scenes). Unlike make_video, a project keeps each scene as a cached clip, so later edits only re-render what changed. Pass the full storyboard once; afterwards use project_patch for edits and project_render to produce (or re-produce) the mp4. Returns {ok, project:{id, title, scenes:[...]}}.',
+      'Create an editable video project: each scene stays a cached clip, so later edits re-render only what changed. Use project_apply to edit or render it.',
     parameters: {
       type: 'object',
-      additionalProperties: false,
       required: ['title'],
       properties: {
-        title: { type: 'string', description: 'Project title' },
+        title: { type: 'string' },
         scenes: {
           type: 'array',
-          description: 'Optional initial storyboard. Each scene: {text, narration, seconds, bg:{c0,c1}, image, motion}',
+          description: 'Initial storyboard; each item is one scene.',
           items: {
             type: 'object',
-            additionalProperties: true,
             properties: {
-              text: { type: 'string', description: 'On-screen text, keep it short' },
-              narration: { type: 'string', description: 'Spoken line for this scene' },
-              seconds: { type: 'number', description: 'Planned seconds (2–12)' },
-              bg: { type: 'object', additionalProperties: true, description: 'Gradient colors {c0,c1} as #rrggbb' },
-              image: { type: 'string', description: 'Image filename or absolute path (optional)' },
-              motion: { type: 'string', description: 'zoom-in | zoom-out | pan-left | pan-right' },
+              text: { type: 'string', description: 'On-screen text; keep it short.' },
+              narration: { type: 'string', description: 'Spoken line for this scene.' },
+              seconds: { type: 'number', description: 'Planned seconds (2-12).' },
+              bg: { type: 'object', description: 'Gradient {c0,c1} as #rrggbb.' },
+              image: { type: 'string', description: 'Image filename or absolute path.' },
+              motion: { type: 'string', description: 'zoom-in | zoom-out | pan-left | pan-right.' },
             },
           },
         },
-        voice: { type: 'string', description: 'TTS voice used for every narration line' },
-        bgm: { type: 'string', description: 'Background music filename (optional)' },
+        voice: { type: 'string', description: 'TTS voice for every narration line.' },
+        bgm: { type: 'string', description: 'BGM filename.' },
       },
     },
     output: { schema: { type: 'object' }, render: (_a, v) => textBlock(describeProject(v)) },
@@ -293,73 +267,83 @@ export function apply(ctx, config) {
     },
   });
 
+  // 3) 编辑 + 渲染：有 patches 先打补丁，有 scope 再渲染，都没有就只查状态 -------
   ctx.tools.register({
-    name: 'project_patch',
+    name: 'project_apply',
     description:
-      'Edit an existing project by sending ONLY the changes — never resend the whole storyboard (that wastes tokens and time). Each patch targets one scene by index: {op:"patch", index, patch:{text?|narration?|seconds?|bg?|image?|motion?}}, or {op:"insert", index, scene:{...}}, or {op:"delete", index}. Changing narration alone never re-renders imagery. Returns {ok, touched, scenes, willRebuild:[indices], willReuse:[indices]} so you can tell the human how much will be re-rendered.',
+      'Edit and/or render an existing project. patches = minimal per-scene edits; scope renders afterwards (auto|audio|all). Omit both to just read project status.',
     parameters: {
       type: 'object',
-      additionalProperties: false,
-      required: ['id', 'patches'],
-      properties: {
-        id: { type: 'string', description: 'Project id from project_create' },
-        patches: {
-          type: 'array',
-          description: 'List of edits; each is a small object, not a full scene list',
-          items: { type: 'object', additionalProperties: true },
-        },
-      },
-    },
-    output: { schema: { type: 'object' }, render: (_a, v) => textBlock(describePatch(v)) },
-    async execute(args) {
-      const { status, data } = await requestJson('POST', `${baseUrl}/v1/project/patch`, {
-        body: { id: String(args.id || ''), patches: Array.isArray(args.patches) ? args.patches : [] },
-        timeoutMs: 60000,
-      });
-      if (!data || !data.ok) return failure(data, 'patch', status);
-      return {
-        ok: true,
-        touched: data.touched || [],
-        scenes: Number(data.scenes) || 0,
-        willRebuild: data.willRebuild || [],
-        willReuse: data.willReuse || [],
-      };
-    },
-  });
-
-  ctx.tools.register({
-    name: 'project_render',
-    description:
-      'Render a project to mp4. scope:"auto" (default) re-renders only scenes whose visuals changed and reuses the rest — use after editing. scope:"audio" re-does ONLY the narration and audio mix, reusing every cached clip (a few seconds instead of tens); use this when the human only wants different wording/voice. scope:"all" forces a full re-render (slow). Returns {ok, jobId, seconds, bytes, reused, rendered, ms}.',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
       required: ['id'],
       properties: {
-        id: { type: 'string', description: 'Project id' },
+        id: { type: 'string', description: 'Project id from project_create.' },
+        patches: {
+          type: 'array',
+          description: "{op:'patch'|'insert'|'delete', index, patch|scene}.",
+          items: { type: 'object' },
+        },
         scope: {
           type: 'string',
           enum: ['auto', 'audio', 'all'],
-          description: 'auto = only changed scenes; audio = narration only; all = everything',
+          description: 'auto = changed scenes; audio = narration only; all = full.',
         },
-        voice: { type: 'string', description: 'Override TTS voice for this render' },
-        bgm: { type: 'string', description: 'Override background music' },
+        voice: { type: 'string', description: 'Override TTS voice for this render.' },
+        bgm: { type: 'string', description: 'Override BGM for this render.' },
       },
     },
-    output: { schema: { type: 'object' }, render: (_a, v) => textBlock(describeRender(v, videoUrl)) },
+    output: { schema: { type: 'object' }, render: (_a, v) => textBlock(describeApply(v, videoUrl)) },
     async execute(args) {
+      const a = args || {};
+      const id = String(a.id || '').trim();
+      // patches 只要是个数组就算"要打补丁"（空数组是合法的 no-op）；
+      // scope 只有显式给了才算"要渲染"，否则会被当成"顺便渲一下"。
+      const hasPatches = Array.isArray(a.patches);
+      const hasScope = a.scope !== undefined && a.scope !== null && String(a.scope).trim() !== '';
+
+      // 第一步：打补丁。只发改动，不发整份分镜。
+      let patched = null;
+      if (hasPatches) {
+        const { status, data } = await requestJson('POST', `${baseUrl}/v1/project/patch`, {
+          body: { id, patches: a.patches },
+          timeoutMs: 60000,
+        });
+        if (!data || !data.ok) return failure(data, 'patch', status);
+        patched = {
+          touched: data.touched || [],
+          scenes: Number(data.scenes) || 0,
+          willRebuild: data.willRebuild || [],
+          willReuse: data.willReuse || [],
+        };
+      }
+
+      // 第二步：没给 scope。打过补丁就只汇报补丁结果，否则只查项目状态。
+      if (!hasScope) {
+        if (patched) return { ok: true, ...patched };
+
+        const { status, data } = await requestJson(
+          'GET',
+          `${baseUrl}/v1/project?id=${encodeURIComponent(id)}`,
+        );
+        if (!data || !data.ok) return failure(data, 'status', status);
+        const p = data.project || {};
+        return {
+          ok: true,
+          project: {
+            id: String(p.id || ''),
+            title: String(p.title || ''),
+            scenes: summarizeScenes(p),
+            cache: Object.keys(p.cache || {}).length,
+          },
+        };
+      }
+
+      // 第三步：渲染。auto 只重画改过的场次，audio 只重做声音。
       const { status, data } = await requestJson('POST', `${baseUrl}/v1/project/render`, {
-        body: {
-          id: String(args.id || ''),
-          scope: args.scope || 'auto',
-          voice: args.voice,
-          bgm: args.bgm,
-        },
+        body: { id, scope: String(a.scope), voice: a.voice, bgm: a.bgm },
         timeoutMs: 1200000,
       });
       if (!data || !data.ok) return failure(data, 'render', status);
-      return {
-        ok: true,
+      const rendered = {
         jobId: String(data.renderId || data.jobId || ''),
         seconds: Number(data.seconds) || 0,
         bytes: Number(data.bytes) || 0,
@@ -367,45 +351,67 @@ export function apply(ctx, config) {
         rendered: Number(data.rendered) || 0,
         ms: Number(data.ms) || 0,
       };
+      // 打过补丁就把补丁结果一起带上，模型才能解释"这次重画了几场"。
+      return patched ? { ok: true, ...patched, ...rendered } : { ok: true, ...rendered };
     },
   });
 }
 
-/** project_create 的人话小结 */
+/** project_create / 查状态的人话小结 */
 function describeProject(value) {
   if (!value || value.ok === false) {
     return `没有建成项目：${(value && value.error) || '未知原因'}。\n${JSON.stringify(value)}`;
   }
   const p = value.project || {};
   return `项目已建立：《${p.title}》，id=${p.id}，${(p.scenes || []).length} 场。`
-    + '接下来用 project_patch 改、project_render 出片。\n' + JSON.stringify(value);
+    + '接下来用 project_apply 改、出片。\n' + JSON.stringify(value);
 }
 
-/** project_patch 的人话小结：重点说清"会不会重画" */
-function describePatch(value) {
+/**
+ * project_apply 的人话小结。
+ * 三种结果：查状态（project）/ 只打补丁（touched）/ 渲染（jobId）；
+ * 打了补丁又渲染时两段都输出，模型才能解释"这次重画了几场"。
+ */
+function describeApply(value, videoUrl) {
   if (!value || value.ok === false) {
-    return `没有改成：${(value && value.error) || '未知原因'}。\n${JSON.stringify(value)}`;
+    const head = value && value.stage === 'render'
+      ? '渲染失败'
+      : value && value.stage === 'patch'
+        ? '没有改成'
+        : value && value.stage === 'status'
+          ? '查不到这个项目'
+          : '项目操作失败';
+    return `${head}：${(value && value.error) || '未知原因'}。\n${JSON.stringify(value)}`;
   }
+  if (value.project) {
+    const p = value.project;
+    const head = `项目状态：《${p.title || '未命名'}》，id=${p.id}，${(p.scenes || []).length} 场，已缓存 ${p.cache || 0} 段。`;
+    return `${head}\n${JSON.stringify(value)}`;
+  }
+  const lines = [];
+  if (Array.isArray(value.touched)) lines.push(patchHead(value));
+  if ('jobId' in value) lines.push(...renderHead(value, videoUrl));
+  lines.push(JSON.stringify(value));
+  return lines.join('\n');
+}
+
+/** 补丁小结：重点说清"会不会重画" */
+function patchHead(value) {
   const rebuild = (value.willRebuild || []).length;
   const reuse = (value.willReuse || []).length;
-  const head = rebuild
+  return rebuild
     ? `已改 ${(value.touched || []).length} 处，下次渲染需重画 ${rebuild} 场、复用 ${reuse} 场。`
     : `已改 ${(value.touched || []).length} 处，画面不需要重画（下次可以直接 scope:"audio" 只重做声音）。`;
-  return `${head}\n${JSON.stringify(value)}`;
 }
 
-/** project_render 的人话小结 */
-function describeRender(value, videoUrl) {
-  if (!value || value.ok === false) {
-    return `渲染失败：${(value && value.error) || '未知原因'}。\n${JSON.stringify(value)}`;
-  }
+/** 渲染小结：成片大小 + 重画/复用场次 + 取片地址 */
+function renderHead(value, videoUrl) {
   const kb = Math.round((Number(value.bytes) || 0) / 1024);
   const lines = [
     `成片已生成：${value.seconds} 秒，${kb} KB；本次重画 ${value.rendered} 场、复用 ${value.reused} 场，耗时 ${(value.ms / 1000).toFixed(1)} 秒。`,
   ];
   if (videoUrl && value.jobId) lines.push(`可用 ${videoUrl}/v1/video?id=${encodeURIComponent(value.jobId)} 取回。`);
-  lines.push(JSON.stringify(value));
-  return lines.join('\n');
+  return lines;
 }
 
 /**
