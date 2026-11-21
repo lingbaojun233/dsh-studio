@@ -47,7 +47,13 @@ function headersFor(body) {
   return headers;
 }
 
-async function requestJson(method, url, { body, timeoutMs = 30000 } = {}) {
+// Node 20+ 才有 AbortSignal.any；更老的运行时退化为只有本地超时。
+function withOuterSignal(local, outer) {
+  if (!outer) return local;
+  return typeof AbortSignal.any === 'function' ? AbortSignal.any([local, outer]) : local;
+}
+
+async function requestJson(method, url, { body, timeoutMs = 30000, outerSignal } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -55,7 +61,7 @@ async function requestJson(method, url, { body, timeoutMs = 30000 } = {}) {
       method,
       headers: headersFor(body),
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
+      signal: withOuterSignal(controller.signal, outerSignal),
     });
     const text = await res.text();
     try {
@@ -66,6 +72,10 @@ async function requestJson(method, url, { body, timeoutMs = 30000 } = {}) {
     }
   } catch (err) {
     if (err && err.name === 'AbortError') {
+      // 区分「宿主取消」和「本地超时」：前者不该提示模型重试。
+      if (outerSignal && outerSignal.aborted) {
+        return { status: 0, data: { ok: false, error: 'ABORTED', message: 'the caller cancelled this tool call' } };
+      }
       return {
         status: 0,
         data: { ok: false, error: 'TIMEOUT', message: `请求超过 ${Math.round(timeoutMs / 1000)} 秒未返回` },
@@ -164,7 +174,9 @@ export function apply(ctx, config) {
         return textBlock(planOnly ? describePlan(value) : describeVideo(value, videoUrl));
       },
     },
-    async execute(args) {
+    // 本地请求预算是 20 分钟，宿主多给 5 秒，避免两边同时到点。
+    timeoutMs: CREATE_TIMEOUT_MS + 5000,
+    async execute(args, exec) {
       const a = args || {};
       const planOnly = a.plan_only === true;
       const prompt = String(a.prompt || '').trim();
@@ -177,6 +189,7 @@ export function apply(ctx, config) {
         const { status, data } = await requestJson('POST', `${baseUrl}/v1/plan`, {
           body: payload,
           timeoutMs: PLAN_TIMEOUT_MS,
+          outerSignal: exec && exec.signal,
         });
         if (!data || !data.ok) return failure(data, 'plan', status);
 
@@ -195,6 +208,7 @@ export function apply(ctx, config) {
       const { status, data } = await requestJson('POST', `${baseUrl}/v1/create`, {
         body: payload,
         timeoutMs: CREATE_TIMEOUT_MS,
+        outerSignal: exec && exec.signal,
       });
       if (!data || !data.ok) return failure(data, 'create', status);
 
@@ -243,7 +257,9 @@ export function apply(ctx, config) {
       },
     },
     output: { schema: { type: 'object' }, render: (_a, v) => textBlock(describeProject(v)) },
-    async execute(args) {
+    // 建项目只是写配置，60s 请求预算 + 5s 余量。
+    timeoutMs: 65000,
+    async execute(args, exec) {
       const { status, data } = await requestJson('POST', `${baseUrl}/v1/project`, {
         body: {
           title: String(args.title || ''),
@@ -252,6 +268,7 @@ export function apply(ctx, config) {
           bgm: args.bgm,
         },
         timeoutMs: 60000,
+        outerSignal: exec && exec.signal,
       });
       if (!data || !data.ok) return failure(data, 'project', status);
       const p = data.project || {};
@@ -292,7 +309,9 @@ export function apply(ctx, config) {
       },
     },
     output: { schema: { type: 'object' }, render: (_a, v) => textBlock(describeApply(v, videoUrl)) },
-    async execute(args) {
+    // 和渲染请求的 20 分钟预算对齐；补丁/查状态远小于它。
+    timeoutMs: 1205000,
+    async execute(args, exec) {
       const a = args || {};
       const id = String(a.id || '').trim();
       // patches 只要是个数组就算"要打补丁"（空数组是合法的 no-op）；
@@ -306,6 +325,7 @@ export function apply(ctx, config) {
         const { status, data } = await requestJson('POST', `${baseUrl}/v1/project/patch`, {
           body: { id, patches: a.patches },
           timeoutMs: 60000,
+          outerSignal: exec && exec.signal,
         });
         if (!data || !data.ok) return failure(data, 'patch', status);
         patched = {
@@ -323,6 +343,7 @@ export function apply(ctx, config) {
         const { status, data } = await requestJson(
           'GET',
           `${baseUrl}/v1/project?id=${encodeURIComponent(id)}`,
+          { outerSignal: exec && exec.signal },
         );
         if (!data || !data.ok) return failure(data, 'status', status);
         const p = data.project || {};
@@ -341,6 +362,7 @@ export function apply(ctx, config) {
       const { status, data } = await requestJson('POST', `${baseUrl}/v1/project/render`, {
         body: { id, scope: String(a.scope), voice: a.voice, bgm: a.bgm },
         timeoutMs: 1200000,
+        outerSignal: exec && exec.signal,
       });
       if (!data || !data.ok) return failure(data, 'render', status);
       const rendered = {
