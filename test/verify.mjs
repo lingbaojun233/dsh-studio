@@ -37,6 +37,21 @@ const stub = http.createServer((req, res) => {
     }
     if (req.url.startsWith('/v1/project/patch')) return send({ ok: true, touched: [0], scenes: 1, willRebuild: [], willReuse: [0] });
     if (req.url.startsWith('/v1/project/render')) return send({ ok: true, renderId: 'r1', seconds: 8, bytes: 100, reused: 0, rendered: 1, ms: 5 });
+    if (req.url.startsWith('/v1/aivideo')) {
+      return send({
+        ok: true,
+        path: 'C:\\Apps\\DSH-MultiTool\\data\\studio\\aivideo\\ai-abc123.mp4',
+        file: 'C:\\Apps\\DSH-MultiTool\\data\\studio\\aivideo\\ai-abc123.mp4',
+        taskId: 'task-abc-123',
+        ms: 100500,
+        bytes: 17301504,
+        seconds: 5,
+        width: 1280,
+        height: 720,
+        prompt: 'anime style, cel shading, wide shot, a girl flying over a snowy plain',
+        size: '1280*720',
+      });
+    }
     if (req.url.startsWith('/v1/project')) return send({ ok: true, project: { id: 'p1', title: 't', scenes: [], cache: {} } });
     return send({ ok: false, error: 'unexpected' });
   });
@@ -57,7 +72,7 @@ try {
 
   const { ctx, tools } = makeCtx();
   mod.apply(ctx, { baseUrl: base, videoUrl: base });
-  assert.deepEqual([...tools.keys()].sort(), ['make_video', 'project_apply', 'project_create']);
+  assert.deepEqual([...tools.keys()].sort(), ['gen_video', 'make_video', 'project_apply', 'project_create']);
 
   for (const [name, def] of tools) {
     assert.ok(def.description && def.description.length <= 2200, `${name} 描述过长`);
@@ -159,6 +174,55 @@ try {
   const created = await tools.get('project_create').execute({ title: 't' });
   assert.equal(created.ok, true);
   assert.deepEqual(seen.map((s) => s.url.split('?')[0]), ['/v1/project']);
+
+  // ------------------------------------------------------------ gen_video --
+  // 独立生成 AI 片段：只打 /v1/aivideo，参数和返回形状都要对
+  const GV_PROMPT = 'anime style, cel shading, wide shot, a girl flying over a snowy plain';
+  seen.length = 0;
+  const gv = await tools.get('gen_video').execute({ prompt: GV_PROMPT, seconds: 5 });
+  assert.deepEqual(seen.map((s) => s.url.split('?')[0]), ['/v1/aivideo'], 'gen_video 应打 /v1/aivideo');
+  assert.equal(gv.ok, true);
+  assert.equal(gv.path, 'C:\\Apps\\DSH-MultiTool\\data\\studio\\aivideo\\ai-abc123.mp4', 'gen_video 要原样带回 path');
+  assert.equal(gv.taskId, 'task-abc-123');
+  assert.equal(gv.ms, 100500);
+  assert.equal(gv.seconds, 5);
+  assert.equal(seen[0].body.prompt, GV_PROMPT);
+  assert.equal(seen[0].body.seconds, 5);
+
+  // 空 prompt：直接报错，不发请求
+  seen.length = 0;
+  const gvEmpty = await tools.get('gen_video').execute({ prompt: '   ' });
+  assert.equal(gvEmpty.ok, false);
+  assert.equal(gvEmpty.error, 'PROMPT_REQUIRED');
+  assert.equal(seen.length, 0, '空 prompt 不该发请求');
+
+  // 工具描述必须讲清"慢、占额度、公式图表用 manim"，否则模型会拿它画公式
+  const gvDesc = tools.get('gen_video').description;
+  for (const word of ['~100 s', 'quota', 'make_video', 'prompt']) {
+    assert.ok(gvDesc.includes(word), `gen_video 描述缺少 ${word}`);
+  }
+  assert.equal(tools.get('gen_video').timeoutMs, 480000, 'gen_video 超时应为 480 秒');
+  assert.deepEqual(tools.get('gen_video').parameters.required, ['prompt']);
+
+  // 渲染格式：成功/失败都要给人话
+  const gvRender = tools.get('gen_video').output.render({}, gv);
+  assert.ok(String(gvRender[0].text).includes('AI 片段已生成'), 'gen_video 成功文案');
+  assert.ok(String(gvRender[0].text).includes('ai-abc123.mp4'), '成功文案要带文件路径');
+
+  // storyboard 里 aivideo 场的 video.prompt 要原样带到 from-scenes（不让 studio 再翻一遍）
+  seen.length = 0;
+  const aiSb = await tools.get('make_video').execute({
+    storyboard: [{
+      text: '雪原飞行', narration: '她在雪原上飞', seconds: 5, tool: 'aivideo',
+      video: { prompt: 'anime style, wide shot, flying over snow', size: '1280*720' },
+    }],
+    plan_only: true,
+  });
+  assert.deepEqual(seen.map((s) => s.url.split('?')[0]), ['/v1/storyboard/from-scenes']);
+  assert.equal(seen[0].body.scenes[0].tool, 'aivideo');
+  assert.equal(seen[0].body.scenes[0].video.prompt, 'anime style, wide shot, flying over snow');
+  assert.equal(seen[0].body.scenes[0].video.size, '1280*720');
+  assert.equal(aiSb.ok, true);
 
   // 失败结果要保留配音错误码与重试次数（模型才能解释"为什么没成"）
   const failDesc = mod.__describeVideoForTest
