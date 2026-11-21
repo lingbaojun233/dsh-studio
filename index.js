@@ -31,13 +31,29 @@ function trimBase(url) {
  * 为什么吞异常：工具失败应该变成模型看得懂的结构化结果（ok:false + 原因），
  * 而不是一段堆栈 —— 堆栈对模型没有信息量，宿主还会把这次调用记成"崩了"。
  */
+/**
+ * 请求头。
+ * 关键一条：把当前用户 id 带给 studio。studio 需要替模型去调 io 写分镜，
+ * 而插件运行在 DSH 进程里，没有用户 token；带上 x-dsh-user 后，studio 可以用
+ * 内部令牌 + 这个 id 完成鉴权（踩过：不带就是 E_UNAUTHORIZED）。
+ */
+function headersFor(body) {
+  const headers = {};
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  const uid = Number(process.env.DSH_USER_ID || 0);
+  if (Number.isInteger(uid) && uid > 0) headers['x-dsh-user'] = String(uid);
+  const sessionId = String(process.env.DSH_SESSION_ID || '').trim();
+  if (sessionId) headers['x-dsh-session'] = sessionId;
+  return headers;
+}
+
 async function requestJson(method, url, { body, timeoutMs = 30000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       method,
-      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      headers: headersFor(body),
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: controller.signal,
     });
