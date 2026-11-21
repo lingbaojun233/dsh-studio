@@ -1,0 +1,9 @@
+# 插入两个工具（make_video / make_plan）。id 和 name 都带 dsh- 前缀，避免和其他 bundle 撞行。
+# config 是"默认值"，用户在插件详情里改过以后以用户配置为准；环境变量见 README 的兜底顺序。
+- insert:
+    - id: dsh-studio
+      name: 'dsh-studio'
+      config:
+        baseUrl: 'http://127.0.0.1:8772'
+        # 取片地址的前缀：只用来拼 ${videoUrl}/v1/video?id=<jobId>，插件自己不会去请求它。
+        videoUrl: 'http://127.0.0.1:8766'

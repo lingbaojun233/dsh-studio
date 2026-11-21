@@ -1,0 +1,23 @@
+# 插件本身零依赖；这些是本地验证/宿主安装时可能出现的产物，不该进仓库
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# 日志与临时文件
+*.log
+logs/
+.work/
+tmp/
+coverage/
+
+# 本地环境配置（端口、机器地址、token 都不要提交）
+.env
+.env.*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

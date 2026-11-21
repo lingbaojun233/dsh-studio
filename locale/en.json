@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Studio",
+    "description": "把 studio 的视频创作能力注册成 DSH 原生工具：make_video 写分镜并真渲染 mp4，make_plan 只出分镜不渲染。"
+  }
+}
