@@ -35,5 +35,14 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lingbaojun233/dsh-studio.git"
+  },
+  "homepage": "https://github.com/lingbaojun233/dsh-studio#readme",
+  "bugs": {
+    "url": "https://github.com/lingbaojun233/dsh-studio/issues"
+  },
+  "author": "lingbaojun233"
 }
